@@ -200,13 +200,17 @@ async function parseBody(req) {
   let raw = "";
   for await (const chunk of req) raw += chunk;
   if (!raw) return {};
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
-    const error = new Error("请求体必须是合法JSON");
-    error.status = 400;
-    throw error;
+    throw httpError(400, "请求体必须是合法JSON");
   }
+  // 只接受 JSON 对象：整体为 null、数组、数字/字符串/布尔原始值一律按参数错误拒绝
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw httpError(400, "请求体必须是JSON对象");
+  }
+  return parsed;
 }
 
 function makeId(prefix) {
@@ -261,10 +265,13 @@ function buildProgress(db, tuneId) {
 }
 
 // 金额以整数分存储，避免浮点误差
+// 金额入参必须是非负有限数字；布尔、数组、null、数字文本、NaN/Infinity 一律拒绝
 function yuanToCents(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) throw httpError(400, "费率必须是非负数字（元/小时）");
-  return Math.round(n * 100);
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw httpError(400, "费率必须是非负有限数字（元/小时），不接受布尔、数组、空值或数字文本");
+  }
+  if (value < 0) throw httpError(400, "费率必须是非负数字（元/小时）");
+  return Math.round(value * 100);
 }
 
 function centsToYuan(cents) {
@@ -880,15 +887,36 @@ async function handle(req, res) {
     const occurredMs = parseTime(body.occurredAt, "occurredAt");
 
     const adjustment = await transaction((db) => {
-      if (body.tuneId) findTune(db, body.tuneId);
       let entry = null;
       if (body.entryId) {
         entry = db.timeEntries.find((e) => e.id === body.entryId);
         if (!entry) throw httpError(404, "关联工时不存在");
         if (entry.status !== "confirmed") throw httpError(409, "只能对已确认工时开调整单");
+
+        // 归属必须与关联工时完全一致：传入不同值即参数错误（整体失败，不写调整单）
+        const mismatch = [];
+        for (const field of ["tuneId", "sectionId", "workerId", "machineId"]) {
+          if (body[field] !== undefined && body[field] !== null && body[field] !== entry[field]) {
+            mismatch.push(field);
+          }
+        }
+        if (mismatch.length) {
+          throw httpError(
+            400,
+            `调整单归属与关联工时 ${entry.id} 不一致的字段：${mismatch.join("、")}；` +
+              "请省略这些字段（自动沿用关联工时）或传入完全一致的值"
+          );
+        }
       }
-      if (body.workerId && !db.workers.some((w) => w.id === body.workerId)) throw httpError(404, "工人不存在");
-      if (body.machineId && !db.machines.some((m) => m.id === body.machineId)) throw httpError(404, "机台不存在");
+
+      // 无关联工时或未显式传值时才需要独立校验存在性；关联工时上的取值必然有效
+      if (!entry && body.tuneId) findTune(db, body.tuneId);
+      if (!entry && body.workerId && !db.workers.some((w) => w.id === body.workerId)) {
+        throw httpError(404, "工人不存在");
+      }
+      if (!entry && body.machineId && !db.machines.some((m) => m.id === body.machineId)) {
+        throw httpError(404, "机台不存在");
+      }
 
       const item = {
         id: makeId("adj"),
@@ -975,9 +1003,10 @@ async function handle(req, res) {
 }
 
 function yuanToCentsSigned(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) throw httpError(400, "调整金额必须是数字（元，可为负）");
-  return Math.round(n * 100);
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw httpError(400, "调整金额必须是有限数字（元，可为负），不接受布尔、数组、空值或数字文本");
+  }
+  return Math.round(value * 100);
 }
 
 const server = http.createServer((req, res) => {

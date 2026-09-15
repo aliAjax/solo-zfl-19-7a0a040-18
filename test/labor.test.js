@@ -91,6 +91,42 @@ function api(method, urlPath, body) {
   });
 }
 
+// 发送原始请求体（用于 null/数组/非法JSON 等反例）
+function apiRaw(method, urlPath, rawBody, contentType = "application/json") {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: HOST,
+        port,
+        path: urlPath,
+        method,
+        headers:
+          rawBody === null || rawBody === undefined
+            ? { "Content-Length": 4 }
+            : { "Content-Type": contentType, "Content-Length": Buffer.byteLength(rawBody) }
+      },
+      (res) => {
+        let raw = "";
+        res.on("data", (d) => (raw += d));
+        res.on("end", () => {
+          let json = null;
+          try {
+            json = raw ? JSON.parse(raw) : null;
+          } catch {
+            reject(new Error(`非JSON响应 ${res.statusCode}: ${raw}`));
+            return;
+          }
+          resolve({ status: res.statusCode, body: json });
+        });
+      }
+    );
+    req.on("error", reject);
+    if (rawBody !== null && rawBody !== undefined) req.write(rawBody);
+    else req.write("null");
+    req.end();
+  });
+}
+
 // 公共资源 id，在测试1/2中建立，后续用例复用
 const ids = {};
 
@@ -770,3 +806,166 @@ test("10. 重启后费率、调整、明细完全一致，规则继续生效", a
     .filter((f) => f.startsWith(path.basename(dbFile) + ".tmp-"));
   assert.equal(tmpFiles.length, 0);
 });
+
+test("11. 入参边界反例：归属一致、金额严格数字、null/非对象请求体", async () => {
+  // 准备一条全新的已确认工时用于关联调整
+  const entry = await api("POST", "/time-entries", {
+    tuneId: "tune_demo",
+    sectionId: "section_demo_1",
+    workerId: ids.w1,
+    machineId: ids.m1,
+    startAt: "2026-09-21T08:00:00Z",
+    endAt: "2026-09-21T09:00:00Z"
+  });
+  assert.equal(entry.status, 201);
+  const confirm = await api("POST", `/time-entries/${entry.body.data.id}/confirm`, {});
+  assert.equal(confirm.status, 201);
+
+  const adjCountBefore = (await api("GET", "/adjustments")).body.data.length;
+  const adjBase = {
+    reasonType: "correction",
+    entryId: entry.body.data.id,
+    amount: -5,
+    occurredAt: "2026-09-21T09:00:00Z"
+  };
+
+  // 11A. 关联已确认工时时，归属四字段传入不同值一律 400，且错误信息指出字段、不写调整单
+  const mismatchCases = [
+    { workerId: ids.w2 },
+    { machineId: ids.m2 },
+    { sectionId: "section_demo_2" },
+    { tuneId: "tune_does_not_exist" }
+  ];
+  for (const override of mismatchCases) {
+    const res = await api("POST", "/adjustments", { ...adjBase, ...override });
+    assert.equal(res.status, 400, `应拒绝归属不一致: ${JSON.stringify(override)} -> ${JSON.stringify(res.body)}`);
+    const field = Object.keys(override)[0];
+    assert.match(res.body.error, new RegExp(field));
+  }
+  assert.equal((await api("GET", "/adjustments")).body.data.length, adjCountBefore);
+
+  // 不存在的工时 404（而非按不一致处理），草稿工时 409——都不写调整
+  const noEntry = await api("POST", "/adjustments", { ...adjBase, entryId: "entry_nope" });
+  assert.equal(noEntry.status, 404);
+  const draft = await api("POST", "/time-entries", {
+    tuneId: "tune_demo",
+    sectionId: "section_demo_1",
+    workerId: ids.w2,
+    machineId: ids.m2,
+    startAt: "2026-09-22T08:00:00Z",
+    endAt: "2026-09-22T09:00:00Z"
+  });
+  const onDraft = await api("POST", "/adjustments", { ...adjBase, entryId: draft.body.data.id });
+  assert.equal(onDraft.status, 409);
+  assert.equal((await api("GET", "/adjustments")).body.data.length, adjCountBefore);
+
+  // 11B. 归属显式传成完全一致的值 -> 201；只传 entryId 自动沿用 -> 201
+  const same = await api("POST", "/adjustments", {
+    ...adjBase,
+    amount: -3,
+    tuneId: "tune_demo",
+    sectionId: "section_demo_1",
+    workerId: ids.w1,
+    machineId: ids.m1,
+    reason: "显式一致"
+  });
+  assert.equal(same.status, 201, JSON.stringify(same.body));
+  assert.equal(same.body.data.tuneId, "tune_demo");
+  assert.equal(same.body.data.sectionId, "section_demo_1");
+  assert.equal(same.body.data.workerId, ids.w1);
+  assert.equal(same.body.data.machineId, ids.m1);
+
+  const inherit = await api("POST", "/adjustments", {
+    ...adjBase,
+    amount: 2,
+    reason: "只传entryId自动沿用"
+  });
+  assert.equal(inherit.status, 201, JSON.stringify(inherit.body));
+  assert.equal(inherit.body.data.tuneId, "tune_demo");
+  assert.equal(inherit.body.data.workerId, ids.w1);
+  assert.equal(inherit.body.data.machineId, ids.m1);
+  assert.equal((await api("GET", "/adjustments")).body.data.length, adjCountBefore + 2);
+
+  // 历史明细不受影响
+  const fees = await api("GET", `/fee-details?entryId=${entry.body.data.id}`);
+  assert.equal(fees.body.summary.totalAmount, 100);
+
+  // 11C. 调整金额只接受有限数字：布尔/数组/空值/数字文本/缺省全部 400
+  const badAmounts = [true, false, "10", [10], null, {}, -Infinity];
+  for (const bad of badAmounts) {
+    const res = await api("POST", "/adjustments", { ...adjBase, amount: bad });
+    assert.equal(res.status, 400, `amount=${JSON.stringify(bad)} 应被拒绝`);
+  }
+  // NaN 经 JSON.stringify 变为 null；1e999 解析为 Infinity（原始报文）也必须拒绝
+  const huge = await apiRaw(
+    "POST",
+    "/adjustments",
+    JSON.stringify({ ...adjBase, amount: 1e999 })
+  );
+  assert.equal(huge.status, 400);
+  assert.equal((await api("GET", "/adjustments")).body.data.length, adjCountBefore + 2);
+
+  // 11D. 费率金额同样严格：非法类型 400；有限小数接受
+  const wb = await api("POST", "/workers", { name: "边界工", code: "BW" });
+  const ratePayload = (amount) => ({
+    targetType: "worker",
+    targetId: wb.body.data.id,
+    amount,
+    effectiveFrom: "2026-11-01T00:00:00Z"
+  });
+  for (const bad of [true, "50", [50], null, -1]) {
+    const res = await api("POST", "/rates", ratePayload(bad));
+    assert.equal(res.status, 400, `费率 amount=${JSON.stringify(bad)} 应被拒绝`);
+  }
+  const decimal = await api("POST", "/rates", ratePayload(55.5));
+  assert.equal(decimal.status, 201, JSON.stringify(decimal.body));
+  assert.equal(decimal.body.data.amountCents, 5550);
+  assert.equal(decimal.body.data.amount, 55.5);
+
+  // 11E. 请求体整体为 null/数组/原始值/非法JSON：一律 400 参数错误，绝不 500
+  const postEndpoints = ["/tunes", "/rates", "/time-entries", "/adjustments", "/issues", "/workers"];
+  for (const urlPath of postEndpoints) {
+    for (const raw of ["null", "[]", '"x"', "123", "{not-json"]) {
+      const res = await apiRaw("POST", urlPath, raw);
+      assert.equal(res.status, 400, `POST ${urlPath} body=${raw} 应返回400，实际 ${res.status}`);
+      assert.match(res.body.error, /JSON|对象/);
+    }
+  }
+  // PATCH 旧接口同样不能因 null 请求体抛内部错误
+  const patchNull = await apiRaw("PATCH", "/sections/section_demo_1/check", "null");
+  assert.equal(patchNull.status, 400);
+
+  // 11F. 反例之后原流程回归：登记→冲突校验→确认拆账→查询→调整汇总 全部正常
+  const another = await api("POST", "/time-entries", {
+    tuneId: "tune_demo",
+    sectionId: "section_demo_2",
+    workerId: ids.w1,
+    machineId: ids.m1,
+    startAt: "2026-09-23T08:00:00Z",
+    endAt: "2026-09-23T10:00:00Z"
+  });
+  assert.equal(another.status, 201);
+  const clash = await api("POST", "/time-entries", {
+    tuneId: "tune_demo",
+    sectionId: "section_demo_2",
+    workerId: ids.w1,
+    machineId: ids.m1,
+    startAt: "2026-09-23T09:00:00Z",
+    endAt: "2026-09-23T11:00:00Z"
+  });
+  assert.equal(clash.status, 409);
+  const okConfirm = await api("POST", `/time-entries/${another.body.data.id}/confirm`, {});
+  assert.equal(okConfirm.status, 201);
+  assert.equal(okConfirm.body.feeDetails.length, 2); // 9/23 不跨午夜、费率恒定
+  assert.equal(okConfirm.body.data.totalAmount, 200); // 2h*(70+30)
+
+  const report = await api("GET", `/cost-report?workerId=${ids.w1}&month=2026-09`);
+  assert.equal(report.status, 200);
+  assert.equal(
+    report.body.data.totalAmount,
+    report.body.data.feesAmount + report.body.data.adjustmentsAmount
+  );
+  // 本用例新增调整：-3 + 2 = -1；加上测试7的 +15，w1 的 9 月调整合计恰为 14
+  assert.equal(report.body.data.adjustmentsAmount, 14);
+});
+
