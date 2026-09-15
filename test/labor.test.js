@@ -969,3 +969,192 @@ test("11. 入参边界反例：归属一致、金额严格数字、null/非对�
   assert.equal(report.body.data.adjustmentsAmount, 14);
 });
 
+test("12. 金额换算安全整数边界：费率/调整上下限、合法小数取整、计费溢出不写半条", async () => {
+  const MAX_CENTS = Number.MAX_SAFE_INTEGER; // 9007199254740991
+  const MAX_YUAN = MAX_CENTS / 100; // 90071992547409.91
+  const w = (await api("POST", "/workers", { name: "溢出工", code: "OFW" })).body.data;
+  const m = (await api("POST", "/machines", { name: "溢出机", code: "OFM" })).body.data;
+
+  // 12A. 费率上限：边界值可用，分值精确不丢精度
+  const boundaryRate = await api("POST", "/rates", {
+    targetType: "worker",
+    targetId: w.id,
+    amount: MAX_YUAN,
+    effectiveFrom: "2026-09-01T00:00:00Z"
+  });
+  assert.equal(boundaryRate.status, 201, JSON.stringify(boundaryRate.body));
+  assert.equal(boundaryRate.body.data.amountCents, MAX_CENTS);
+  assert.equal(boundaryRate.body.data.amount, MAX_YUAN);
+
+  // 超过上限：再多 0.01（浮点上 90071992547409.92 → 9007199254740992 分）拒绝
+  const over = await api("POST", "/rates", {
+    targetType: "worker",
+    targetId: w.id,
+    amount: MAX_YUAN + 0.01,
+    effectiveFrom: "2026-10-01T00:00:00Z"
+  });
+  assert.equal(over.status, 400);
+  assert.match(over.body.error, /安全整数/);
+  // 巨大有限数 / Infinity（原始报文）同样 400
+  assert.equal(
+    (await api("POST", "/rates", {
+      targetType: "worker", targetId: w.id, amount: 1e308, effectiveFrom: "2026-10-01T00:00:00Z"
+    })).status,
+    400
+  );
+  assert.equal((await apiRaw("POST", "/rates", JSON.stringify({
+    targetType: "worker", targetId: w.id, amount: 1e999, effectiveFrom: "2026-10-01T00:00:00Z"
+  }))).status, 400);
+
+  // 费率下限：0 合法；负数拒绝；非数字类型仍拒绝
+  const zeroRate = await api("POST", "/rates", {
+    targetType: "machine", targetId: m.id, amount: 0, effectiveFrom: "2026-09-01T00:00:00Z"
+  });
+  assert.equal(zeroRate.status, 201);
+  assert.equal(zeroRate.body.data.amountCents, 0);
+  for (const bad of [-0.01, "-1", true, [90071992547409.91], null]) {
+    const r = await api("POST", "/rates", {
+      targetType: "machine", targetId: m.id, amount: bad, effectiveFrom: "2026-11-01T00:00:00Z"
+    });
+    assert.equal(r.status, 400, `费率 amount=${JSON.stringify(bad)} 应被拒绝`);
+  }
+
+  // 12B. 合法小数仍按现有规则 Math.round 取整（半进位）
+  const wd = (await api("POST", "/workers", { name: "小数工", code: "DCW" })).body.data;
+  const md = (await api("POST", "/machines", { name: "小数机", code: "DCM" })).body.data;
+  // 9 月基准小数费率（供后续确认回归），再用 11 月的连续区间验证各种小数取整
+  const sepRate = await api("POST", "/rates", {
+    targetType: "worker", targetId: wd.id, amount: 55.5, effectiveFrom: "2026-09-01T00:00:00Z"
+  });
+  assert.equal(sepRate.status, 201);
+  const cases = [
+    [55.5, 5550, "2026-11-01T00:00:00Z"],
+    [0.004, 0, "2026-11-02T00:00:00Z"],
+    [0.005, 1, "2026-11-03T00:00:00Z"],
+    [0.006, 1, "2026-11-04T00:00:00Z"],
+    [12.345, 1235, "2026-11-05T00:00:00Z"]
+  ];
+  for (const [amt, cents, from] of cases) {
+    const r = await api("POST", "/rates", {
+      targetType: "worker", targetId: wd.id, amount: amt, effectiveFrom: from
+    });
+    assert.equal(r.status, 201, `amount=${amt}`);
+    assert.equal(r.body.data.amountCents, cents, `amount=${amt} 应取整为 ${cents} 分`);
+  }
+  // 小数机台恒定 10.005 元/小时
+  await api("POST", "/rates", {
+    targetType: "machine", targetId: md.id, amount: 10.005, effectiveFrom: "2026-09-01T00:00:00Z"
+  });
+
+  // 12C. 调整金额上下限：±边界值可用且精确；越界 400 不写
+  const seedEntry = await api("POST", "/time-entries", {
+    tuneId: "tune_demo", sectionId: "section_demo_2", workerId: wd.id, machineId: md.id,
+    startAt: "2026-09-24T08:00:00Z", endAt: "2026-09-24T09:00:00Z"
+  });
+  await api("POST", `/time-entries/${seedEntry.body.data.id}/confirm`, {});
+
+  const adjMax = await api("POST", "/adjustments", {
+    reasonType: "backfill", amount: MAX_YUAN, occurredAt: "2026-09-24T10:00:00Z",
+    tuneId: "tune_demo", workerId: wd.id
+  });
+  assert.equal(adjMax.status, 201, JSON.stringify(adjMax.body));
+  assert.equal(adjMax.body.data.amountCents, MAX_CENTS);
+  assert.equal(adjMax.body.data.amount, MAX_YUAN);
+
+  const adjMin = await api("POST", "/adjustments", {
+    reasonType: "correction", entryId: seedEntry.body.data.id,
+    amount: -MAX_YUAN, occurredAt: "2026-09-24T11:00:00Z"
+  });
+  assert.equal(adjMin.status, 201, JSON.stringify(adjMin.body));
+  assert.equal(adjMin.body.data.amountCents, -MAX_CENTS);
+  assert.equal(adjMin.body.data.amount, -MAX_YUAN);
+
+  const adjCount = (await api("GET", "/adjustments")).body.data.length;
+  for (const bad of [MAX_YUAN + 0.01, -(MAX_YUAN + 0.01), 1e308, "90071992547409.91", true, [1], null]) {
+    const r = await api("POST", "/adjustments", {
+      reasonType: "correction", entryId: seedEntry.body.data.id,
+      amount: bad, occurredAt: "2026-09-24T12:00:00Z"
+    });
+    assert.equal(r.status, 400, `调整 amount=${JSON.stringify(bad)} 应被拒绝`);
+  }
+  // 越界拒绝后调整单数量不变（失败不留记录）
+  assert.equal((await api("GET", "/adjustments")).body.data.length, adjCount);
+
+  // 12D. 确认时计费换算溢出：MAX 费率 × 61 分钟 > MAX_CENTS → 422，整条不落、无半条
+  const overflowEntry = await api("POST", "/time-entries", {
+    tuneId: "tune_demo", sectionId: "section_demo_1", workerId: w.id, machineId: m.id,
+    startAt: "2026-09-25T08:00:00Z", endAt: "2026-09-25T09:01:00Z" // 61 分钟
+  });
+  assert.equal(overflowEntry.status, 201);
+  const failConfirm = await api("POST", `/time-entries/${overflowEntry.body.data.id}/confirm`, {});
+  assert.equal(failConfirm.status, 422, JSON.stringify(failConfirm.body));
+  assert.match(failConfirm.body.error, /安全整数/);
+  // 仍是草稿，没有任何关联明细（哪怕机台费 0 元也不会留下机台半条）
+  const stillDraft = await api("GET", `/time-entries/${overflowEntry.body.data.id}`);
+  assert.equal(stillDraft.body.data.status, "draft");
+  assert.equal(stillDraft.body.feeDetails.length, 0);
+  assert.equal(
+    (await api("GET", `/fee-details?entryId=${overflowEntry.body.data.id}`)).body.data.length, 0
+  );
+
+  // 12E. 边界费率 × 满 60 分钟恰为 MAX_CENTS，可确认、不丢精度
+  const edgeEntry = await api("POST", "/time-entries", {
+    tuneId: "tune_demo", sectionId: "section_demo_1", workerId: w.id, machineId: m.id,
+    startAt: "2026-09-26T08:00:00Z", endAt: "2026-09-26T09:00:00Z" // 60 分钟
+  });
+  const edgeConfirm = await api("POST", `/time-entries/${edgeEntry.body.data.id}/confirm`, {});
+  assert.equal(edgeConfirm.status, 201, JSON.stringify(edgeConfirm.body));
+  const laborFee = edgeConfirm.body.feeDetails.find((f) => f.kind === "labor");
+  assert.equal(laborFee.amountCents, MAX_CENTS);
+  assert.equal(laborFee.amount, MAX_YUAN);
+  const machineFee = edgeConfirm.body.feeDetails.find((f) => f.kind === "machine");
+  assert.equal(machineFee.amountCents, 0); // 机台 0 费率
+  assert.equal(edgeConfirm.body.data.totalAmountCents, MAX_CENTS);
+
+  // 12F. 原流程回归：小数费率确认拆分、查询汇总、归属校验在边界改动后全部正常
+  const decEntry = await api("POST", "/time-entries", {
+    tuneId: "tune_demo", sectionId: "section_demo_2", workerId: wd.id, machineId: md.id,
+    startAt: "2026-09-27T10:00:00Z", endAt: "2026-09-27T11:30:00Z" // 90 分钟
+  });
+  assert.equal(decEntry.status, 201);
+  const decConfirm = await api("POST", `/time-entries/${decEntry.body.data.id}/confirm`, {});
+  assert.equal(decConfirm.status, 201, JSON.stringify(decConfirm.body));
+  const decLabor = decConfirm.body.feeDetails.find((f) => f.kind === "labor");
+  assert.equal(decLabor.rateAmountCents, 5550); // 55.50 元/小时
+  assert.equal(decLabor.amountCents, 8325); // 55.50 × 1.5h
+  const decMachine = decConfirm.body.feeDetails.find((f) => f.kind === "machine");
+  assert.equal(decMachine.rateAmountCents, 1001); // 10.005 取整后 1001 分
+  assert.equal(decMachine.amountCents, 1502); // round(1001 × 1.5)
+  assert.equal(decConfirm.body.data.totalAmountCents, 9827);
+
+  const got = await api("GET", `/fee-details?entryId=${decEntry.body.data.id}`);
+  assert.equal(got.body.summary.totalAmountCents, 9827);
+  const report = await api("GET", `/cost-report?workerId=${wd.id}&month=2026-09`);
+  assert.equal(
+    report.body.data.totalAmountCents,
+    report.body.data.feesAmountCents + report.body.data.adjustmentsAmountCents
+  );
+  // 归属一致性校验仍在：用别人的 workerId 关联本条工时 -> 400 且不写
+  const adjBefore = (await api("GET", `/adjustments?entryId=${decEntry.body.data.id}`)).body.data.length;
+  const adjWrongWorker = await api("POST", "/adjustments", {
+    reasonType: "correction", entryId: decEntry.body.data.id, workerId: w.id,
+    amount: -1, occurredAt: "2026-09-27T12:00:00Z"
+  });
+  assert.equal(adjWrongWorker.status, 400);
+  assert.equal(
+    (await api("GET", `/adjustments?entryId=${decEntry.body.data.id}`)).body.data.length,
+    adjBefore
+  );
+  // 并发行为不受影响：同一工人同一时段并发只成一条
+  const race = await Promise.all(
+    Array.from({ length: 4 }, () =>
+      api("POST", "/time-entries", {
+        tuneId: "tune_demo", sectionId: "section_demo_1", workerId: wd.id, machineId: md.id,
+        startAt: "2026-09-28T08:00:00Z", endAt: "2026-09-28T09:00:00Z"
+      })
+    )
+  );
+  assert.equal(race.filter((r) => r.status === 201).length, 1);
+  assert.equal(race.filter((r) => r.status === 409).length, 3);
+});
+

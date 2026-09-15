@@ -265,14 +265,32 @@ function buildProgress(db, tuneId) {
 }
 
 // 金额以整数分存储，避免浮点误差
-// 金额入参必须是非负有限数字；布尔、数组、null、数字文本、NaN/Infinity 一律拒绝
-function yuanToCents(value) {
+// 金额入参必须是有限数字；布尔、数组、null、数字文本、NaN/Infinity 一律拒绝。
+// 换算成分后必须仍在安全整数范围内，否则丢精度，直接按参数错误拒绝。
+const MAX_AMOUNT_CENTS = Number.MAX_SAFE_INTEGER;
+const MAX_AMOUNT_YUAN = MAX_AMOUNT_CENTS / 100;
+
+function toCents(value, { nonNegative, label }) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw httpError(400, "费率必须是非负有限数字（元/小时），不接受布尔、数组、空值或数字文本");
+    throw httpError(400, `${label}必须是有限数字（元），不接受布尔、数组、空值或数字文本`);
   }
-  if (value < 0) throw httpError(400, "费率必须是非负数字（元/小时）");
-  return Math.round(value * 100);
+  if (nonNegative && value < 0) {
+    throw httpError(400, `${label}必须是非负数字（元）`);
+  }
+  const cents = Math.round(value * 100);
+  if (!Number.isSafeInteger(cents)) {
+    const range = nonNegative
+      ? `最大允许 ${MAX_AMOUNT_YUAN} 元`
+      : `允许范围 -${MAX_AMOUNT_YUAN} ~ ${MAX_AMOUNT_YUAN} 元`;
+    throw httpError(400, `${label}换算成分后超出安全整数范围（9007199254740991 分），${range}`);
+  }
+  return cents;
 }
+
+const yuanToCents = (value) =>
+  toCents(value, { nonNegative: true, label: "费率" });
+const yuanToCentsSigned = (value) =>
+  toCents(value, { nonNegative: false, label: "调整金额" });
 
 function centsToYuan(cents) {
   return Math.round(cents) / 100;
@@ -359,6 +377,7 @@ function buildFeeDetails(db, entry) {
   ];
   const details = [];
   for (const spec of specs) {
+    const label = spec.targetType === "worker" ? "工人" : "机台";
     const bounds = splitBoundaries(db, spec.targetType, spec.targetId, entry.startMs, entry.endMs);
     for (let i = 0; i < bounds.length - 1; i++) {
       const segStart = bounds[i];
@@ -366,7 +385,6 @@ function buildFeeDetails(db, entry) {
       if (segEnd <= segStart) continue;
       const rate = rateAt(db, spec.targetType, spec.targetId, segStart);
       if (!rate) {
-        const label = spec.targetType === "worker" ? "工人" : "机台";
         throw httpError(
           422,
           `${label}在 ${new Date(segStart).toISOString()} 没有生效费率，请先补登记费率再确认`
@@ -374,6 +392,13 @@ function buildFeeDetails(db, entry) {
       }
       const minutes = (segEnd - segStart) / 60000;
       const amountCents = Math.round((rate.amountCents * minutes) / 60);
+      if (!Number.isSafeInteger(amountCents)) {
+        // 费率×时长溢出安全整数：拒绝整条确认（事务回滚，不写任何半条明细），避免丢精度
+        throw httpError(
+          422,
+          `${label}在 ${new Date(segStart).toISOString()} ~ ${new Date(segEnd).toISOString()} 的费用（${rate.amountCents} 分 × ${minutes} 分钟）超出安全整数范围，请调整费率后再确认`
+        );
+      }
       details.push({
         id: makeId("fee"),
         entryId: entry.id,
@@ -1000,13 +1025,6 @@ async function handle(req, res) {
   }
 
   return send(res, 404, { error: "接口不存在", routes });
-}
-
-function yuanToCentsSigned(value) {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw httpError(400, "调整金额必须是有限数字（元，可为负），不接受布尔、数组、空值或数字文本");
-  }
-  return Math.round(value * 100);
 }
 
 const server = http.createServer((req, res) => {
