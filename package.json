@@ -1,0 +1,14 @@
+{
+  "name": "organ-strip-punch-api",
+  "version": "1.1.0",
+  "description": "手摇风琴纸带打孔服务（含生产工时核算）",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
